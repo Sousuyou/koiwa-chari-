@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>小岩チャリ走 〜終電からにげきれ〜</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    height: 100%;
+    background: #f2f2ee;
+    font-family: "Hiragino Maru Gothic ProN", "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+    overflow: hidden;
+    touch-action: manipulation;
+  }
+  #wrap { position: relative; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block;
+    background: #ffffff;
+    max-width: 100%;
+    max-height: 100%;
+    box-shadow: 0 0 0 2px #111, 0 10px 40px rgba(0,0,0,0.25);
+  }
+  #overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #111; text-align: center;
+    background: rgba(255,255,255,0.92);
+    padding: 20px;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 {
+    font-size: clamp(26px, 6.5vw, 52px);
+    letter-spacing: 3px; margin-bottom: 6px;
+    -webkit-text-stroke: 1px #111;
+  }
+  #overlay .sub { font-size: clamp(12px, 3.2vw, 18px); color: #555; margin-bottom: 20px; letter-spacing: 2px; }
+  #overlay p { font-size: clamp(12px, 3.4vw, 16px); line-height: 1.8; margin-bottom: 6px; color: #333; }
+  #overlay .score-big { font-size: clamp(22px, 6vw, 38px); font-weight: bold; margin: 8px 0; }
+  .btn {
+    margin-top: 22px; padding: 14px 46px;
+    font-size: clamp(18px, 5vw, 24px); font-weight: bold;
+    color: #fff; background: #111; border: 2px solid #111; border-radius: 40px;
+    cursor: pointer; letter-spacing: 2px;
+    transition: transform 0.05s, background 0.1s;
+  }
+  .btn:hover { background: #333; }
+  .btn:active { transform: translateY(3px); }
+  .hint { margin-top: 16px; font-size: clamp(11px, 2.8vw, 14px); color: #888; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="900" height="506"></canvas>
+  <div id="overlay">
+    <h1>小岩チャリ走</h1>
+    <div class="sub">〜 終電からにげきれ！ 〜</div>
+    <p>飲みすぎて終電ピンチ！🚲💨</p>
+    <p>小岩の街を、丘を駆けあがり、谷を飛び越えて走る。</p>
+    <p>谷（江戸川）に落ちず、背後の終電に追いつかれる前に遠くへ！</p>
+    <p>メダルを拾うと、逃げる余裕（ゲージ）が回復。</p>
+    <button class="btn" id="startBtn">スタート</button>
+    <div class="hint">タップ / クリック / スペースキーでジャンプ<br>長押しで高く・連打で多段ジャンプ</div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+
+const W = canvas.width;     // 900
+const H = canvas.height;    // 506
+const BASE_Y = 400;         // 地形の基準ライン（画面y）
+const PLAYER_X = 160;       // プレイヤーの画面上の固定x
+const STEP = 16;            // 地形サンプリング間隔(ワールド)
+
+// localStorageはfile://(特にSafari)で例外を投げることがあるので安全に扱う
+function loadBest() { try { return Number(localStorage.getItem('koiwaBest3') || 0) || 0; } catch (e) { return 0; } }
+function saveBest(v) { try { localStorage.setItem('koiwaBest3', v); } catch (e) {} }
+
+let state = 'title';
+let coins = 0;
+let best = loadBest();
+let chase = 0;
+let shake = 0;
+
+const player = {
+  worldX: 0, y: BASE_Y, vy: 0,
+  onGround: true, jumps: 0, wheelAngle: 0, tilt: 0,
+  falling: false, // 谷へ落下中か（ジャンプ中の着地と区別するため）
+  w: 32, h: 28,   // チャリ走っぽく小さめ（当たり判定用サイズ）
+};
+const PLAYER_DRAW = 54;    // 自転車の描画基準サイズ
+const PLAYER_SCALE = 0.6;  // 豆粒サイズに縮小して描画
+const GRAVITY = 0.85;
+const JUMP_POWER = -14;
+const MAX_JUMPS = 3;
+let holding = false;
+
+let terrain = [];   // {x(world), y(screen), gap(bool)}
+let genX = 0;       // 次に地形を生成するワールドx
+let lastWasGap = false;
+let coinsArr = [];  // {x(world), y(screen), r, got}
+let landmarks = []; // 背景シルエット {x(world), kind, w, h, label, layer}
+let landGenX = 0;
+let clouds = [];
+
+function camX() { return player.worldX - PLAYER_X; }
+
+// ===== 初期化 =====
+function reset() {
+  coins = 0; chase = 0; shake = 0;
+  terrain = []; coinsArr = []; landmarks = [];
+  genX = 0; landGenX = 0; lastWasGap = false;
+  player.worldX = 0; player.y = BASE_Y; player.vy = 0;
+  player.onGround = true; player.jumps = 0; player.tilt = 0; player.falling = false;
+  // 平地スタート（最初は安全に）
+  pushFlat(380, true);
+  while (genX < W + 400) generateSegment();
+  while (landGenX < W + 400) generateLandmark();
+  clouds = [];
+  for (let i = 0; i < 5; i++) clouds.push({ x: (i * 213) % W, y: 30 + (i * 47) % 110, s: 0.6 + (i % 3) * 0.25 });
+}
+
+function pushPoint(x, y, gap) { terrain.push({ x, y, gap: !!gap }); }
+
+function pushFlat(len, startup) {
+  const n = Math.max(2, Math.round(len / STEP));
+  for (let i = 0; i <= n; i++) pushPoint(genX + i * STEP, BASE_Y, false);
+  genX += len;
+  lastWasGap = false;
+}
+
+function pushHill(amp, len) {
+  const n = Math.max(4, Math.round(len / STEP));
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const y = BASE_Y - amp * Math.sin(Math.PI * t);   // 両端BASE_Yの丘
+    pushPoint(genX + i * STEP, y, false);
+  }
+  genX += len;
+  lastWasGap = false;
+}
+
+function pushRolling(len) {
+  // 連続した小さな丘（うねうね・なめらか）
+  const n = Math.max(8, Math.round(len / STEP));
+  const waves = 2 + Math.floor(Math.random() * 2);
+  const amp = 26 + Math.random() * 26;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const env = Math.sin(Math.PI * t);                       // 両端をなだらかに地面へ
+    const wave = 0.5 - 0.5 * Math.cos(2 * Math.PI * waves * t); // 0..1のなめらかな波（尖らない）
+    pushPoint(genX + i * STEP, BASE_Y - amp * env * wave, false);
+  }
+  genX += len;
+  lastWasGap = false;
+}
+
+function pushGap(len) {
+  // 谷（地面なし）。両端はBASE_Y。間はgap点。
+  const n = Math.max(3, Math.round(len / STEP));
+  for (let i = 0; i <= n; i++) {
+    const edge = (i === 0 || i === n);
+    pushPoint(genX + i * STEP, BASE_Y, !edge);
+  }
+  genX += len;
+  lastWasGap = true;
+}
+
+function generateSegment() {
+  const r = Math.random();
+  if (!lastWasGap && r < 0.22) {
+    // 谷の前にちょい助走の丘、谷の手前は飛び出しやすいように
+    pushGap(85 + Math.random() * 55);
+    // 谷の上にメダルのアーチ
+    placeCoinArc(genX - 55, 140);
+  } else if (r < 0.5) {
+    const amp = 42 + Math.random() * 55;
+    pushHill(amp, 220 + Math.random() * 150);
+    // 丘の頂上にメダル
+    placeCoinArc(genX - 140, 110);
+  } else if (r < 0.78) {
+    pushRolling(180 + Math.random() * 160);
+  } else {
+    pushFlat(110 + Math.random() * 120);
+    if (Math.random() < 0.5) placeCoinLine(genX - 100);
+  }
+}
+
+// メダルを置く高さの基準（地面があればその高さ、谷の上なら基準ライン）
+function coinBaseY(x) { const g = groundYAt(x); return g === null ? BASE_Y : g; }
+function placeCoinArc(centerWorldX, span) {
+  const n = 5;
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    const x = centerWorldX + (t - 0.5) * span;
+    const lift = 48 + Math.sin(Math.PI * t) * 46; // 地面から山なりに浮かせる
+    coinsArr.push({ x, y: coinBaseY(x) - lift, r: 12, got: false });
+  }
+}
+function placeCoinLine(startWorldX) {
+  const n = 3 + Math.floor(Math.random() * 3);
+  const lift = 54 + Math.random() * 36;
+  for (let i = 0; i < n; i++) {
+    const x = startWorldX + i * 34;
+    coinsArr.push({ x, y: coinBaseY(x) - lift, r: 12, got: false });
+  }
+}
+
+const SIGNS = ['餃子', 'もつ焼', '居酒屋', 'ラーメン', '酒場', 'せんべろ'];
+function generateLandmark() {
+  const r = Math.random();
+  let m;
+  if (r < 0.11) m = { x: landGenX, kind: 'station', w: 180, h: 120, layer: 1 };
+  else if (r < 0.20) m = { x: landGenX, kind: 'arch', w: 150, h: 78, layer: 1 };
+  else if (r < 0.29) m = { x: landGenX, kind: 'bridge', w: 210, h: 54, layer: 1 };
+  else if (r < 0.39) m = { x: landGenX, kind: 'post', w: 56, h: 116, layer: 0 };
+  else if (r < 0.57) m = { x: landGenX, kind: 'sign', w: 60, h: 130 + Math.random() * 60, label: SIGNS[Math.floor(Math.random()*SIGNS.length)], layer: 0 };
+  else if (r < 0.72) m = { x: landGenX, kind: 'lantern', w: 70, h: 96 + Math.random() * 40, layer: 0 };
+  else m = { x: landGenX, kind: 'building', w: 60 + Math.random() * 70, h: 80 + Math.random() * 130, layer: Math.random() < 0.5 ? 0 : 1 };
+  landmarks.push(m);
+  landGenX += m.w + 24 + Math.random() * 30;
+}
+
+// ===== 地形クエリ =====
+function groundYAt(wx) {
+  // wxを挟む2点で線形補間。gapならnull。
+  for (let i = 1; i < terrain.length; i++) {
+    if (terrain[i].x >= wx) {
+      const a = terrain[i - 1], b = terrain[i];
+      if (a.gap || b.gap) return null;
+      const t = (wx - a.x) / (b.x - a.x);
+      return a.y + (b.y - a.y) * t;
+    }
+  }
+  return terrain.length ? terrain[terrain.length - 1].y : BASE_Y;
+}
+
+// ===== 入力 =====
+function jump() {
+  if (state !== 'playing') return;
+  if (player.jumps < MAX_JUMPS) { player.vy = JUMP_POWER; player.onGround = false; player.jumps++; }
+}
+function press() {
+  if (state === 'title' || state === 'over') { startGame(); return; }
+  holding = true; jump();
+}
+function release() { holding = false; }
+
+canvas.addEventListener('mousedown', (e) => { e.preventDefault(); press(); });
+canvas.addEventListener('mouseup', release);
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); press(); }, { passive: false });
+canvas.addEventListener('touchend', (e) => { e.preventDefault(); release(); }, { passive: false });
+window.addEventListener('keydown', (e) => { if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); press(); } });
+window.addEventListener('keyup', (e) => { if (e.code === 'Space' || e.code === 'ArrowUp') release(); });
+document.addEventListener('click', (e) => { if (e.target && e.target.id === 'startBtn') startGame(); });
+const initBtn = document.getElementById('startBtn');
+if (initBtn) initBtn.addEventListener('click', startGame);
+
+function startGame() { reset(); state = 'playing'; overlay.classList.add('hidden'); }
+
+function gameOver(title) {
+  state = 'over';
+  const total = coins * 30 + Math.floor(player.worldX / 10);
+  if (total > best) { best = total; saveBest(best); }
+  overlay.innerHTML =
+    '<h1>' + title + '</h1>' +
+    '<div class="sub">〜 終電からにげきれ！ 〜</div>' +
+    '<div class="score-big">スコア ' + total + '</div>' +
+    '<p>メダル ' + coins + ' 枚　／　走った距離 ' + Math.floor(player.worldX / 10) + ' m</p>' +
+    '<p>ベスト ' + best + '</p>' +
+    '<button class="btn" id="startBtn">もう一回</button>' +
+    '<div class="hint">タップ / クリック / スペースキーでジャンプ<br>長押しで高く・連打で多段ジャンプ</div>';
+  overlay.classList.remove('hidden');
+}
+
+// ===== 速度 =====
+function curSpeed() { return 5.5 + Math.min(player.worldX / 6000, 6.5); }
+
+// ===== 更新 =====
+function update() {
+  if (state !== 'playing') return;
+  const speed = curSpeed();
+  if (shake > 0) shake--;
+
+  // 追手ゲージは逃げているぶん減る
+  chase -= 0.11;
+  if (chase < 0) chase = 0;
+  if (chase >= 100) { gameOver('終電に追いつかれた…🚃'); return; }
+
+  // 前進
+  player.worldX += speed;
+
+  // 物理（判定は車体の中心で行う）
+  player.vy += GRAVITY;
+  if (!holding && player.vy < -4) player.vy = -4; // 可変ジャンプ
+  player.y += player.vy;
+  player.wheelAngle += speed * 0.14;
+
+  const cx = player.worldX + player.w / 2;
+  const gy = groundYAt(cx);
+  if (player.onGround) {
+    // 接地中：地面に吸着（坂もなめらかに走る）。谷に踏み込んだら落下開始。
+    if (gy === null) { player.onGround = false; player.falling = true; }
+    else { player.y = gy; player.vy = 0; player.jumps = 0; }
+  }
+  if (!player.onGround) {
+    if (!player.falling && gy !== null && player.vy >= 0 && player.y >= gy) {
+      // ジャンプから着地（谷への落下中=fallingは着地させない）
+      player.y = gy; player.vy = 0; player.onGround = true; player.jumps = 0; player.falling = false;
+    } else if (player.y > H + 90) {
+      gameOver('江戸川に落ちた！🌊'); return;
+    }
+  }
+
+  // 自転車の傾き：接地時は地形の傾斜、空中は徐々に水平へ
+  if (player.onGround) {
+    const a = groundYAt(cx - 14), b = groundYAt(cx + 14);
+    if (a !== null && b !== null) player.tilt = Math.atan2(b - a, 28);
+  } else {
+    player.tilt += (Math.max(-0.5, Math.min(0.5, player.vy * 0.03)) - player.tilt) * 0.1;
+  }
+
+  // 地形・背景の追加生成と掃除
+  while (genX < camX() + W + 400) generateSegment();
+  while (landGenX < camX() + W + 400) generateLandmark();
+  while (terrain.length > 2 && terrain[1].x < camX() - 40) terrain.shift();
+  landmarks = landmarks.filter(m => m.x + m.w > camX() - 60);
+  coinsArr = coinsArr.filter(c => c.x > camX() - 60 && !c.got);
+
+  // 雲
+  for (const c of clouds) { c.x -= speed * 0.1 * c.s; if (c.x < -70) { c.x = W + 50; c.y = 30 + Math.random() * 110; } }
+
+  // メダル取得
+  const pcx = player.worldX + player.w / 2;
+  const pcy = player.y - player.h / 2;
+  for (const c of coinsArr) {
+    const dx = pcx - c.x, dy = pcy - c.y;
+    if (dx * dx + dy * dy < (c.r + 18) * (c.r + 18)) { c.got = true; coins++; chase = Math.max(0, chase - 5); }
+  }
+}
+
+// ===== 描画 =====
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+
+  // 背景（白）
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(-20, -20, W + 40, H + 40);
+
+  // 雲（細い線画）
+  ctx.strokeStyle = '#cfcfcf'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+  for (const c of clouds) drawCloud(c.x, c.y, c.s);
+
+  // 遠景の小岩シルエット（パララックス）
+  for (const m of landmarks) if (m.layer === 1) drawLandmark(m, 0.5, '#dcdcdc');
+  for (const m of landmarks) if (m.layer === 0) drawLandmark(m, 0.7, '#bcbcbc');
+
+  // 地形
+  drawTerrain();
+
+  // メダル
+  for (const c of coinsArr) drawCoin(c.x - camX(), c.y, c.r);
+
+  // プレイヤー
+  drawPlayer();
+
+  // 終電（追手）
+  drawTrain(trainScreenX());
+
+  ctx.restore();
+
+  // HUD
+  drawHUD();
+}
+
+function trainScreenX() {
+  const trainW = 200;
+  return -380 + (chase / 100) * (PLAYER_X - trainW + 40 - (-380));
+}
+
+function drawCloud(x, y, s) {
+  ctx.beginPath();
+  ctx.arc(x, y, 14 * s, Math.PI * 0.5, Math.PI * 1.5);
+  ctx.arc(x + 18 * s, y - 8 * s, 16 * s, Math.PI * 0.9, Math.PI * 2.1);
+  ctx.arc(x + 40 * s, y, 13 * s, Math.PI * 1.5, Math.PI * 0.5);
+  ctx.stroke();
+}
+
+function drawLandmark(m, parallax, color) {
+  const sx = (m.x - camX() * parallax) % (W + 1200);
+  const x = m.x - camX() * parallax;
+  if (x + m.w < -100 || x > W + 100) return;
+  const base = BASE_Y - 4;
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+
+  if (m.kind === 'station') {
+    const top = base - m.h;
+    ctx.fillRect(x, top, m.w, m.h);
+    // 駅名（白抜き）
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x + 18, top + 8, m.w - 36, 20);
+    ctx.fillStyle = '#555'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('JR 小岩駅', x + m.w / 2, top + 23);
+    return;
+  }
+  if (m.kind === 'arch') {
+    const top = base - m.h;
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.moveTo(x, base); ctx.lineTo(x, top + 20);
+    ctx.arc(x + m.w / 2, top + 20, m.w / 2, Math.PI, 0);
+    ctx.lineTo(x + m.w, base);
+    ctx.stroke();
+    ctx.fillStyle = color; ctx.fillRect(x - 4, top, m.w + 8, 16);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('小岩フラワーロード', x + m.w / 2, top + 12);
+    return;
+  }
+  if (m.kind === 'sign') {
+    const top = base - m.h;
+    ctx.fillRect(x + m.w / 2 - 14, top, 28, m.h);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'center';
+    const t = m.label || '酒場';
+    for (let i = 0; i < t.length; i++) ctx.fillText(t[i], x + m.w / 2, top + 22 + i * 20);
+    return;
+  }
+  if (m.kind === 'lantern') {
+    const top = base - m.h;
+    ctx.fillRect(x, top, m.w, m.h);
+    // 提灯の輪郭
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.ellipse(x + 18, base - 18, 9, 12, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + m.w - 18, base - 12, 9, 12, 0, 0, Math.PI * 2); ctx.fill();
+    return;
+  }
+  if (m.kind === 'bridge') {
+    // 総武線の鉄橋（江戸川を渡るトラス橋）
+    const topY = base - m.h - 40, botY = base - 40;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(x, botY); ctx.lineTo(x + 22, topY); ctx.lineTo(x + m.w - 22, topY); ctx.lineTo(x + m.w, botY);
+    ctx.moveTo(x, botY); ctx.lineTo(x + m.w, botY);
+    ctx.stroke();
+    ctx.lineWidth = 1.5;
+    for (let bx = x + 22; bx < x + m.w - 22; bx += 26) {
+      ctx.beginPath(); ctx.moveTo(bx, topY); ctx.lineTo(bx + 13, botY); ctx.moveTo(bx + 13, topY); ctx.lineTo(bx, botY); ctx.stroke();
+    }
+    // 橋脚
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x + m.w * 0.5, botY); ctx.lineTo(x + m.w * 0.5, base); ctx.stroke();
+    ctx.fillStyle = color; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('総武線鉄橋', x + m.w / 2, topY - 5);
+    return;
+  }
+  if (m.kind === 'post') {
+    // 「小岩」の駅名標風サイン
+    const top = base - m.h;
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(x + m.w / 2, base); ctx.lineTo(x + m.w / 2, top + 22); ctx.stroke();
+    ctx.fillStyle = color; ctx.fillRect(x, top, m.w, 24);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('小岩', x + m.w / 2, top + 17);
+    return;
+  }
+  // building
+  const top = base - m.h;
+  ctx.fillRect(x, top, m.w, m.h);
+  ctx.fillStyle = '#fff';
+  for (let wy = top + 12; wy < base - 12; wy += 20)
+    for (let wx = x + 8; wx < x + m.w - 10; wx += 16) ctx.fillRect(wx, wy, 8, 10);
+}
+
+function drawTerrain() {
+  // 連続する非gap区間をポリゴンで塗り、谷は川（グレー波）にする
+  ctx.lineWidth = 4; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  let i = 0;
+  const n = terrain.length;
+  while (i < n) {
+    if (terrain[i].gap) {
+      // 谷区間（江戸川）
+      const startX = terrain[i].x - camX();
+      while (i < n && terrain[i].gap) i++;
+      const endX = (i < n ? terrain[i].x : terrain[n - 1].x) - camX();
+      drawValley(startX, endX);
+      continue;
+    }
+    // 地面ポリゴン開始
+    const startIdx = i;
+    while (i < n && !terrain[i].gap) i++;
+    const endIdx = i - 1;
+    // 塗り
+    ctx.beginPath();
+    ctx.moveTo(terrain[startIdx].x - camX(), terrain[startIdx].y);
+    for (let k = startIdx + 1; k <= endIdx; k++) ctx.lineTo(terrain[k].x - camX(), terrain[k].y);
+    const sx = terrain[startIdx].x - camX();
+    const ex = terrain[endIdx].x - camX();
+    ctx.lineTo(ex, H + 20);
+    ctx.lineTo(sx, H + 20);
+    ctx.closePath();
+    ctx.fillStyle = '#222';
+    ctx.fill();
+    // 上辺の線（少し明るく）＋道の白破線
+    ctx.beginPath();
+    ctx.moveTo(terrain[startIdx].x - camX(), terrain[startIdx].y);
+    for (let k = startIdx + 1; k <= endIdx; k++) ctx.lineTo(terrain[k].x - camX(), terrain[k].y);
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 4; ctx.stroke();
+  }
+}
+
+function drawValley(x0, x1) {
+  // 川（江戸川）の水面：連続したゆるい波線
+  ctx.strokeStyle = '#c4c4c4'; ctx.lineWidth = 2;
+  const left = Math.max(x0, -10), right = Math.min(x1, W + 10);
+  for (let wy = BASE_Y + 44; wy < H; wy += 20) {
+    ctx.beginPath();
+    for (let wx = left; wx <= right; wx += 6) {
+      const yy = wy + Math.sin((wx + camX()) * 0.11 + wy) * 2.5;
+      if (wx === left) ctx.moveTo(wx, yy); else ctx.lineTo(wx, yy);
+    }
+    ctx.stroke();
+  }
+  // 「江戸川」ラベル
+  if (x1 - x0 > 70) {
+    ctx.fillStyle = '#9a9a9a'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('江戸川', (x0 + x1) / 2, BASE_Y + 26);
+  }
+}
+
+function drawCoin(sx, sy, r) {
+  ctx.save();
+  // 白塗りに黒縁のメダル（正面向きで見やすく）
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 2.5; ctx.stroke();
+  // 中央の￥マーク
+  ctx.fillStyle = '#111';
+  ctx.font = 'bold ' + Math.round(r * 1.15) + 'px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('¥', sx, sy + 0.5);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+function drawPlayer() {
+  const BW = PLAYER_DRAW;  // 描画基準サイズ（縮小して豆粒に）
+  ctx.save();
+  ctx.translate(PLAYER_X + player.w / 2, player.y);
+  ctx.rotate(player.tilt);
+  ctx.scale(PLAYER_SCALE, PLAYER_SCALE);
+  ctx.translate(-(BW / 2), 0);
+
+  // 影（接地時）
+  if (player.onGround) {
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.beginPath(); ctx.ellipse(BW / 2, 4, 24, 5, 0, 0, Math.PI * 2); ctx.fill();
+  }
+
+  ctx.strokeStyle = '#111'; ctx.fillStyle = '#111';
+  ctx.lineWidth = 3.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  const wheelR = 14;
+  const backX = 8, frontX = BW - 6;
+  const wheelY = -wheelR;
+  drawWheel(backX, wheelY, wheelR);
+  drawWheel(frontX, wheelY, wheelR);
+
+  // フレーム
+  const midX = BW / 2 - 4, seatTop = wheelY - 16;
+  ctx.beginPath();
+  ctx.moveTo(backX, wheelY); ctx.lineTo(midX, seatTop); ctx.lineTo(frontX, wheelY);
+  ctx.moveTo(midX, seatTop); ctx.lineTo(midX + 8, wheelY);
+  ctx.stroke();
+  // ハンドル
+  ctx.beginPath();
+  ctx.moveTo(frontX, wheelY); ctx.lineTo(frontX - 2, wheelY - 18); ctx.lineTo(frontX - 11, wheelY - 18);
+  ctx.stroke();
+
+  // 体
+  const bodyX = midX, bodyTop = seatTop - 18;
+  ctx.beginPath(); ctx.moveTo(bodyX, seatTop); ctx.lineTo(bodyX + 2, bodyTop); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(bodyX + 2, bodyTop + 2); ctx.lineTo(frontX - 9, wheelY - 18); ctx.stroke();
+
+  // 頭（白フード：白塗り＋黒縁）
+  ctx.beginPath(); ctx.arc(bodyX + 3, bodyTop - 10, 11, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = '#111'; ctx.stroke();
+  // 顔ライン（フードの口元）
+  ctx.beginPath(); ctx.arc(bodyX + 3, bodyTop - 10, 11, Math.PI * 1.85, Math.PI * 0.15); ctx.stroke();
+  // 目
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(bodyX + 8, bodyTop - 11, 1.6, 0, Math.PI * 2); ctx.fill();
+
+  ctx.restore();
+}
+
+function drawWheel(cx, cy, r) {
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < 4; i++) {
+    const a = player.wheelAngle + i * (Math.PI / 2);
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * r * 0.85, cy + Math.sin(a) * r * 0.85); ctx.stroke();
+  }
+}
+
+function drawTrain(tx) {
+  const trainW = 200, top = BASE_Y - 110, h = 110;
+  // 車体（白塗り＋黒線＝線画）
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#111'; ctx.lineWidth = 3.5;
+  roundRect(tx, top, trainW, h, 14); ctx.fill(); ctx.stroke();
+  // 帯
+  ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(tx, top + 20); ctx.lineTo(tx + trainW, top + 20); ctx.stroke();
+  // 前面ガラス（黒塗り）
+  ctx.fillStyle = '#111';
+  roundRect(tx + trainW - 60, top + 30, 46, 38, 6); ctx.fill();
+  // 側面窓（黒縁）
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 2.5;
+  for (let wx = tx + 14; wx < tx + trainW - 74; wx += 38) { roundRect(wx, top + 34, 26, 30, 4); ctx.stroke(); }
+  // 行先「終電」
+  ctx.fillStyle = '#111'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('終電', tx + trainW - 37, top + 16);
+  // ロゴ「総武線」
+  ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('総武線', tx + 14, top + 88);
+  // ライト
+  ctx.beginPath(); ctx.arc(tx + trainW - 10, top + h - 16, 6, 0, Math.PI * 2); ctx.stroke();
+  // スピード線
+  ctx.strokeStyle = '#999'; ctx.lineWidth = 2.5;
+  for (let i = 0; i < 4; i++) { const ly = top + 18 + i * 22; ctx.beginPath(); ctx.moveTo(tx - 28 - i * 10, ly); ctx.lineTo(tx - 6, ly); ctx.stroke(); }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawHUD() {
+  // メダル＆距離（白パネル＋黒枠）
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#111'; ctx.lineWidth = 2;
+  ctx.fillRect(14, 14, 236, 60); ctx.strokeRect(14, 14, 236, 60);
+  drawCoin(36, 36, 11);
+  ctx.fillStyle = '#111'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('× ' + coins, 52, 44);
+  ctx.font = '14px sans-serif';
+  ctx.fillText('距離 ' + Math.floor(player.worldX / 10) + ' m  /  ベスト ' + best, 24, 66);
+
+  // 追手ゲージ
+  const bx = W - 286, by = 24, bw = 264, bh = 20;
+  ctx.fillStyle = '#111'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('🚃 終電との距離', bx, by - 8);
+  ctx.fillStyle = '#fff'; ctx.fillRect(bx, by, bw, bh);
+  ctx.fillStyle = '#111'; ctx.fillRect(bx, by, bw * (chase / 100), bh);
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.strokeRect(bx, by, bw, bh);
+  if (chase / 100 >= 0.8) {
+    ctx.fillStyle = (Math.floor(chase) % 2 === 0) ? '#fff' : '#111';
+    ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('あぶない！', bx + bw / 2, by + 15);
+  }
+}
+
+// ===== ループ =====
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+reset();
+state = 'title';
+draw();
+loop();
+</script>
+</body>
+</html>
